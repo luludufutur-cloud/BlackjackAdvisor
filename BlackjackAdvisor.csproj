@@ -2,7 +2,7 @@
 
   <PropertyGroup>
     <AssemblyName>BlackjackAdvisor</AssemblyName>
-    <Version>1.0.0</Version>
+        <Version>1.1.0</Version>
     <Description>Overlay d'aide de decision pour parties de blackjack organisees en chat FFXIV.</Description>
   </PropertyGroup>
 
