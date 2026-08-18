@@ -57,6 +57,11 @@ public sealed class Plugin : IDalamudPlugin
     private bool _inDealerResolution = false;
     private string? _dealerPersonaName = null;
 
+    // Cle utilisee dans Configuration.DealerStatsByName quand le nom du croupier n'a pas
+    // encore pu etre determine (avant la premiere banniere de resolution vue).
+    private const string UnknownDealerKey = "?";
+    private string CurrentDealerKey => string.IsNullOrWhiteSpace(_dealerPersonaName) ? UnknownDealerKey : _dealerPersonaName;
+
     private readonly List<string> _pendingRoundQueue = new();
     private List<string> _activeRoundQueue = new();
     private int _activeQueueIndex = 0;
@@ -118,6 +123,7 @@ public sealed class Plugin : IDalamudPlugin
         _config = PluginInterface.GetPluginConfig() as Configuration ?? new Configuration();
         _overlayVisible = _config.OverlayVisible;
         if (string.IsNullOrEmpty(_config.Language)) _config.Language = "fr";
+        MigrateLegacyDealerStats();
 
         ChatGui.ChatMessage += OnChatMessage;
         PluginInterface.UiBuilder.Draw += DrawOverlay;
@@ -177,6 +183,50 @@ public sealed class Plugin : IDalamudPlugin
         }
     }
 
+    // Migre l'historique anti-triche global (v1, tous croupiers melanges) vers un bucket
+    // "(avant mise a jour)" dans DealerStatsByName, une seule fois, au premier chargement
+    // apres la mise a jour vers la v2. Les nouvelles donnees seront ensuite enregistrees
+    // par croupier via CurrentDealerKey. On ne perd pas l'historique existant, mais on ne
+    // pretend pas non plus qu'il concerne un croupier en particulier.
+    private void MigrateLegacyDealerStats()
+    {
+        var hasLegacyData = _config.DealerUpHistory.Count > 0
+            || _config.DealerRoundCount.Count > 0
+            || _config.DealerBustCount.Count > 0;
+
+        if (!hasLegacyData)
+        {
+            _config.Version = 2;
+            return;
+        }
+
+        const string legacyKey = "? (avant mise a jour v1.1)";
+        var stats = GetOrCreateDealerStats(legacyKey);
+        stats.DealerUpHistory.AddRange(_config.DealerUpHistory);
+        foreach (var kv in _config.DealerRoundCount)
+            stats.DealerRoundCount[kv.Key] = stats.DealerRoundCount.GetValueOrDefault(kv.Key) + kv.Value;
+        foreach (var kv in _config.DealerBustCount)
+            stats.DealerBustCount[kv.Key] = stats.DealerBustCount.GetValueOrDefault(kv.Key) + kv.Value;
+
+        _config.DealerUpHistory.Clear();
+        _config.DealerRoundCount.Clear();
+        _config.DealerBustCount.Clear();
+        _config.Version = 2;
+        SaveConfig(force: true);
+
+        Log.Information($"[BlackjackAdvisor] Migration anti-triche v1 -> v2 : {stats.DealerUpHistory.Count} manches deplacees vers \"{legacyKey}\" (l'historique par croupier repart de zero pour chaque croupier distinct desormais).");
+    }
+
+    private DealerStats GetOrCreateDealerStats(string dealerKey)
+    {
+        if (!_config.DealerStatsByName.TryGetValue(dealerKey, out var stats))
+        {
+            stats = new DealerStats();
+            _config.DealerStatsByName[dealerKey] = stats;
+        }
+        return stats;
+    }
+
     // ===== Localisation =====
     private bool IsFr => _config.Language == "fr";
 
@@ -207,8 +257,8 @@ public sealed class Plugin : IDalamudPlugin
         ["advice_label"] = ("Conseil :", "Advice:"),
         ["advice_waiting"] = ("En attente d'une main...", "Waiting for a hand..."),
         ["advice_waiting_hand"] = ("En attente de ta main...", "Waiting for your hand..."),
-        ["anti_cheat_header"] = ("Analyse anti-triche (beta)", "Anti-cheat analysis (beta)"),
-        ["rounds_recorded"] = ("Manches enregistrees (cumul entre sessions) : {0}", "Rounds recorded (cumulative across sessions): {0}"),
+        ["anti_cheat_header"] = ("Analyse anti-triche (beta) — croupier : {0}", "Anti-cheat analysis (beta) — dealer: {0}"),
+        ["rounds_recorded"] = ("Manches enregistrees avec ce croupier (cumul entre sessions) : {0}", "Rounds recorded with this dealer (cumulative across sessions): {0}"),
         ["chi_square"] = ("Score chi-carre : {0:F2}", "Chi-square score: {0:F2}"),
         ["anti_cheat_note"] = ("Base sur la distribution des cartes visibles du croupier. Indice statistique, pas une preuve formelle.",
                                 "Based on the distribution of the dealer's visible cards. Statistical clue, not formal proof."),
@@ -219,7 +269,7 @@ public sealed class Plugin : IDalamudPlugin
         ["bust_rate_header"] = ("Taux de bust reel vs theorique (par carte visible) :", "Real vs theoretical bust rate (by visible card):"),
         ["export_button"] = ("Exporter l'historique (CSV)", "Export history (CSV)"),
         ["last_export"] = ("Dernier export : {0}", "Last export: {0}"),
-        ["reset_history"] = ("Reinitialiser l'historique", "Reset history"),
+        ["reset_history"] = ("Reinitialiser l'historique de ce croupier", "Reset this dealer's history"),
         ["reset_gil"] = ("Reinitialiser le suivi gil", "Reset gil tracking"),
         ["lang_button"] = ("English", "Francais"),
         ["dealer_resolution"] = ("Croupier (resolution)", "Dealer (resolving)"),
@@ -861,10 +911,12 @@ public sealed class Plugin : IDalamudPlugin
         var category = dealerValue == 11 ? "A" : dealerValue >= 10 ? "10" : dealerValue.ToString();
         _currentRoundDealerUpCategory = category;
 
-        _config.DealerUpHistory.Add(new DealerCardRecord { When = DateTime.Now.ToString("o"), Category = category });
+        var dealerKey = CurrentDealerKey;
+        var stats = GetOrCreateDealerStats(dealerKey);
+        stats.DealerUpHistory.Add(new DealerCardRecord { When = DateTime.Now.ToString("o"), Category = category });
         SaveConfig();
 
-        Log.Information($"[BlackjackAdvisor] (anti-triche) Carte croupier enregistree : {category} (total cumule : {_config.DealerUpHistory.Count})");
+        Log.Information($"[BlackjackAdvisor] (anti-triche) Carte croupier enregistree pour \"{dealerKey}\" : {category} (total cumule pour ce croupier : {stats.DealerUpHistory.Count})");
     }
 
     private void RecordDealerRoundOutcome(bool busted, string? category)
@@ -872,22 +924,25 @@ public sealed class Plugin : IDalamudPlugin
         if (category == null)
             return;
 
-        _config.DealerRoundCount.TryGetValue(category, out var rounds);
-        _config.DealerRoundCount[category] = rounds + 1;
+        var dealerKey = CurrentDealerKey;
+        var stats = GetOrCreateDealerStats(dealerKey);
+
+        stats.DealerRoundCount.TryGetValue(category, out var rounds);
+        stats.DealerRoundCount[category] = rounds + 1;
 
         if (busted)
         {
-            _config.DealerBustCount.TryGetValue(category, out var busts);
-            _config.DealerBustCount[category] = busts + 1;
+            stats.DealerBustCount.TryGetValue(category, out var busts);
+            stats.DealerBustCount[category] = busts + 1;
         }
 
         SaveConfig();
-        Log.Information($"[BlackjackAdvisor] (anti-triche) Resultat croupier : categorie={category}, bust={busted} ({_config.DealerRoundCount[category]} manches cumulees pour cette categorie)");
+        Log.Information($"[BlackjackAdvisor] (anti-triche) Resultat croupier \"{dealerKey}\" : categorie={category}, bust={busted} ({stats.DealerRoundCount[category]} manches cumulees pour cette categorie)");
     }
 
-    private (int rounds, double chiSquare, string verdict, System.Numerics.Vector4 color) AnalyzeDealerBias()
+    private (int rounds, double chiSquare, string verdict, System.Numerics.Vector4 color) AnalyzeDealerBias(DealerStats stats)
     {
-        int n = _config.DealerUpHistory.Count;
+        int n = stats.DealerUpHistory.Count;
         const int minRoundsForAnalysis = 20;
 
         if (n < minRoundsForAnalysis)
@@ -899,7 +954,7 @@ public sealed class Plugin : IDalamudPlugin
         {
             double expectedProp = cat == "10" ? 4.0 / 13.0 : 1.0 / 13.0;
             double expected = expectedProp * n;
-            int observed = _config.DealerUpHistory.Count(x => x.Category == cat);
+            int observed = stats.DealerUpHistory.Count(x => x.Category == cat);
             chiSquare += Math.Pow(observed - expected, 2) / expected;
         }
 
@@ -924,9 +979,10 @@ public sealed class Plugin : IDalamudPlugin
             var path = Path.Combine(dir, $"blackjack_history_{DateTime.Now:yyyyMMdd_HHmmss}.csv");
 
             var sb = new System.Text.StringBuilder();
-            sb.AppendLine("Horodatage,CategorieCarteCroupier");
-            foreach (var rec in _config.DealerUpHistory)
-                sb.AppendLine($"{rec.When},{rec.Category}");
+            sb.AppendLine("Croupier,Horodatage,CategorieCarteCroupier");
+            foreach (var kv in _config.DealerStatsByName)
+                foreach (var rec in kv.Value.DealerUpHistory)
+                    sb.AppendLine($"\"{kv.Key.Replace("\"", "\"\"")}\",{rec.When},{rec.Category}");
 
             File.WriteAllText(path, sb.ToString());
             _lastExportPath = path;
@@ -1196,9 +1252,11 @@ public sealed class Plugin : IDalamudPlugin
             ImGui.TextWrapped(!string.IsNullOrEmpty(_lastAdvice) ? _lastAdvice : T("advice_waiting"));
 
             ImGui.Separator();
-            if (ImGui.CollapsingHeader(T("anti_cheat_header")))
+            var dealerKey = CurrentDealerKey;
+            if (ImGui.CollapsingHeader(T("anti_cheat_header", dealerKey)))
             {
-                var (rounds, chiSquare, verdict, color) = AnalyzeDealerBias();
+                var dealerStats = GetOrCreateDealerStats(dealerKey);
+                var (rounds, chiSquare, verdict, color) = AnalyzeDealerBias(dealerStats);
                 ImGui.Text(T("rounds_recorded", rounds));
                 if (rounds > 0)
                     ImGui.Text(T("chi_square", chiSquare));
@@ -1209,9 +1267,9 @@ public sealed class Plugin : IDalamudPlugin
                 ImGui.Text(T("bust_rate_header"));
                 foreach (var cat in new[] { "2", "3", "4", "5", "6", "7", "8", "9", "10", "A" })
                 {
-                    if (!_config.DealerRoundCount.TryGetValue(cat, out var total) || total < 5)
+                    if (!dealerStats.DealerRoundCount.TryGetValue(cat, out var total) || total < 5)
                         continue;
-                    _config.DealerBustCount.TryGetValue(cat, out var busts);
+                    dealerStats.DealerBustCount.TryGetValue(cat, out var busts);
                     var observed = 100.0 * busts / total;
                     var theoretical = TheoreticalBustRate(cat);
                     var diff = observed - theoretical;
@@ -1231,12 +1289,12 @@ public sealed class Plugin : IDalamudPlugin
 
                 if (ImGui.Button(T("reset_history")))
                 {
-                    _config.DealerUpHistory.Clear();
-                    _config.DealerBustCount.Clear();
-                    _config.DealerRoundCount.Clear();
+                    dealerStats.DealerUpHistory.Clear();
+                    dealerStats.DealerBustCount.Clear();
+                    dealerStats.DealerRoundCount.Clear();
                     _lastRecordedDealerValue = null;
                     SaveConfig(force: true);
-                    Log.Information("[BlackjackAdvisor] (anti-triche) Historique reinitialise (y compris la sauvegarde persistante).");
+                    Log.Information($"[BlackjackAdvisor] (anti-triche) Historique reinitialise pour \"{dealerKey}\" (y compris la sauvegarde persistante).");
                 }
 
                 ImGui.SameLine();

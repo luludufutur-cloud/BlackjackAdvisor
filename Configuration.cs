@@ -13,19 +13,36 @@ public class DealerCardRecord
     public string Category { get; set; } = "";    // "2".."9", "10" (regroupe 10/J/Q/K), "A"
 }
 
+// Statistiques anti-triche pour UN croupier donne (identifie par son nom de persona).
+// Chaque croupier a son propre historique : melanger les croupiers rendrait le test
+// statistique inutile (un croupier honnete + un croupier malhonnete se moyennent).
+[Serializable]
+public class DealerStats
+{
+    public List<DealerCardRecord> DealerUpHistory { get; set; } = new();
+    public Dictionary<string, int> DealerRoundCount { get; set; } = new();
+    public Dictionary<string, int> DealerBustCount { get; set; } = new();
+}
+
 // Sauvegarde persistante entre les sessions (fichier JSON gere par Dalamud, stocke dans le
 // dossier de config du plug-in). C'est ce qui permet a l'analyse anti-triche de s'affiner
 // jour apres jour au lieu de repartir de zero a chaque relance du jeu.
 [Serializable]
 public class Configuration : IPluginConfiguration
 {
-    public int Version { get; set; } = 1;
+    // Version 1 = historique anti-triche global (bug, tous croupiers melanges).
+    // Version 2 = historique anti-triche par croupier (DealerStatsByName).
+    public int Version { get; set; } = 2;
 
-    // Anti-triche : historique complet des cartes visibles du croupier, cumule entre sessions.
+    // Anti-triche : historique par croupier, cle = nom de persona du croupier (ou "?" si le
+    // nom n'a pas pu etre determine). Cumule entre sessions, par croupier.
+    public Dictionary<string, DealerStats> DealerStatsByName { get; set; } = new();
+
+    // ===== Champs legacy (v1, cumul global tous croupiers confondus) =====
+    // Conserves uniquement pour permettre la migration automatique vers DealerStatsByName au
+    // premier chargement apres mise a jour (voir Plugin.MigrateLegacyDealerStats). Plus
+    // alimentes depuis la v2 : ne pas les utiliser ailleurs que dans la migration.
     public List<DealerCardRecord> DealerUpHistory { get; set; } = new();
-
-    // Anti-triche (bust reel vs theorique) : par categorie de carte visible ("2".."9","10","A"),
-    // nombre de manches terminees observees et nombre de bust parmi elles. Cumule entre sessions.
     public Dictionary<string, int> DealerRoundCount { get; set; } = new();
     public Dictionary<string, int> DealerBustCount { get; set; } = new();
 
