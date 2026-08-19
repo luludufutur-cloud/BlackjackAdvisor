@@ -48,6 +48,23 @@ public sealed class Plugin : IDalamudPlugin
     private int? _lastRecordedDealerValue = null;
     private string? _currentRoundDealerUpCategory = null;
 
+    // Anti-doublon pour l'enregistrement anti-triche (carte visible du croupier). La detection de
+    // banniere "phase de resolution" peut clignoter (vrai/faux) sur des lignes de chat proches
+    // (ex: le tour d'un autre joueur mal classe comme resolution du croupier), ce qui reinitialise
+    // _lastRecordedDealerValue et permettait de reenregistrer la meme manche plusieurs fois en
+    // quelques secondes. Une vraie manche de blackjack ne peut pas se terminer et en recommencer
+    // une nouvelle en moins de quelques secondes, donc on refuse tout nouvel enregistrement trop
+    // rapproche du precedent, meme si la valeur de la carte a change.
+    private DateTime _lastDealerRecordUtc = DateTime.MinValue;
+    private static readonly TimeSpan MinDealerRecordInterval = TimeSpan.FromSeconds(10);
+
+    // Anti-doublon pour les resultats de manche (gil) : le meme message "<nom>: X - Win/Loss/..."
+    // peut arriver deux fois (canal duplique, echo du script du croupier, etc.). Sans ca, un
+    // resultat compte deux fois et gonfle artificiellement le bilan net affiche.
+    private string? _lastResultSignature = null;
+    private DateTime _lastResultUtc = DateTime.MinValue;
+    private static readonly TimeSpan ResultDedupWindow = TimeSpan.FromSeconds(5);
+
     private string _lastTurnPlayer = "-";
     private bool _isMyTurn = false;
 
@@ -61,6 +78,32 @@ public sealed class Plugin : IDalamudPlugin
     // encore pu etre determine (avant la premiere banniere de resolution vue).
     private const string UnknownDealerKey = "?";
     private string CurrentDealerKey => string.IsNullOrWhiteSpace(_dealerPersonaName) ? UnknownDealerKey : _dealerPersonaName;
+
+    // Normalise le nom du croupier pour que le meme croupier physique retombe toujours sur la
+    // meme cle dans Configuration.DealerStatsByName, meme si le chat FFXIV decore parfois son nom
+    // avec des glyphes d'icone (zone Unicode privee U+E000-U+F8FF, ex: "★  Dealer")
+    // et d'autres fois non (juste "Dealer"). Sans ca, un seul croupier se retrouve fragmente sur
+    // plusieurs cles differentes et ses stats/compteurs de manches sont eparpilles.
+    private static string NormalizeDealerName(string name)
+    {
+        if (string.IsNullOrWhiteSpace(name))
+            return name;
+
+        var sb = new System.Text.StringBuilder(name.Length);
+        foreach (var ch in name)
+        {
+            // Ignore les glyphes d'icone de la zone Unicode privee (icones FFXIV) et les etoiles
+            // decoratives ; ce ne sont jamais des caracteres significatifs du nom du croupier.
+            if (ch >= '' && ch <= '') continue;
+            if (ch == '★' || ch == '☆') continue;
+            sb.Append(ch);
+        }
+
+        // Reduit les espaces multiples restants (les icones retirees laissent souvent des trous)
+        // et retire les espaces en debut/fin.
+        var collapsed = Regex.Replace(sb.ToString(), @"\s+", " ").Trim();
+        return string.IsNullOrWhiteSpace(collapsed) ? name.Trim() : collapsed;
+    }
 
     private readonly List<string> _pendingRoundQueue = new();
     private List<string> _activeRoundQueue = new();
@@ -124,6 +167,7 @@ public sealed class Plugin : IDalamudPlugin
         _overlayVisible = _config.OverlayVisible;
         if (string.IsNullOrEmpty(_config.Language)) _config.Language = "fr";
         MigrateLegacyDealerStats();
+        MergeDealerStatsByNormalizedName();
 
         ChatGui.ChatMessage += OnChatMessage;
         PluginInterface.UiBuilder.Draw += DrawOverlay;
@@ -215,6 +259,43 @@ public sealed class Plugin : IDalamudPlugin
         SaveConfig(force: true);
 
         Log.Information($"[BlackjackAdvisor] Migration anti-triche v1 -> v2 : {stats.DealerUpHistory.Count} manches deplacees vers \"{legacyKey}\" (l'historique par croupier repart de zero pour chaque croupier distinct desormais).");
+    }
+
+    // Migration v2 -> v3 : avant cette version, le nom du croupier n'etait pas normalise, donc un
+    // meme croupier physique pouvait finir enregistre sous plusieurs cles differentes selon que le
+    // chat decorait son nom avec des glyphes d'icone ou non (ex: "Dealer" et "★  Dealer"). On
+    // fusionne ici toutes les cles existantes qui, une fois normalisees, tombent sur le meme nom.
+    private void MergeDealerStatsByNormalizedName()
+    {
+        if (_config.Version >= 3)
+            return;
+
+        var mergedAny = false;
+        foreach (var oldKey in _config.DealerStatsByName.Keys.ToList())
+        {
+            if (oldKey == UnknownDealerKey)
+                continue;
+
+            var normalizedKey = NormalizeDealerName(oldKey);
+            if (normalizedKey == oldKey)
+                continue;
+
+            var oldStats = _config.DealerStatsByName[oldKey];
+            var targetStats = GetOrCreateDealerStats(normalizedKey);
+            targetStats.DealerUpHistory.AddRange(oldStats.DealerUpHistory);
+            foreach (var kv in oldStats.DealerRoundCount)
+                targetStats.DealerRoundCount[kv.Key] = targetStats.DealerRoundCount.GetValueOrDefault(kv.Key) + kv.Value;
+            foreach (var kv in oldStats.DealerBustCount)
+                targetStats.DealerBustCount[kv.Key] = targetStats.DealerBustCount.GetValueOrDefault(kv.Key) + kv.Value;
+
+            _config.DealerStatsByName.Remove(oldKey);
+            mergedAny = true;
+            Log.Information($"[BlackjackAdvisor] Migration anti-triche v2 -> v3 : fusion de \"{oldKey}\" dans \"{normalizedKey}\".");
+        }
+
+        _config.Version = 3;
+        if (mergedAny)
+            SaveConfig(force: true);
     }
 
     private DealerStats GetOrCreateDealerStats(string dealerKey)
@@ -320,7 +401,21 @@ public sealed class Plugin : IDalamudPlugin
             if (IsLocalPlayerSubstring(resultName))
             {
                 var amountRaw = resultMatch.Groups["amount"].Success ? resultMatch.Groups["amount"].Value : null;
-                HandleMyRoundResult(outcome, amountRaw);
+
+                // Anti-doublon : si on a deja vu exactement ce meme resultat (nom+outcome+montant)
+                // il y a moins de ResultDedupWindow, on l'ignore (echo/duplication du message).
+                var signature = $"{resultName}|{outcome}|{amountRaw}";
+                var now = DateTime.UtcNow;
+                if (signature == _lastResultSignature && now - _lastResultUtc < ResultDedupWindow)
+                {
+                    Log.Information($"[BlackjackAdvisor] Resultat de manche ignore (doublon detecte) : {signature}");
+                }
+                else
+                {
+                    _lastResultSignature = signature;
+                    _lastResultUtc = now;
+                    HandleMyRoundResult(outcome, amountRaw);
+                }
             }
 
             Log.Information($"[BlackjackAdvisor] [{chatType}] Resultat de manche : {resultName} -> {outcome}");
@@ -458,7 +553,7 @@ public sealed class Plugin : IDalamudPlugin
                 _inDealerResolution = true;
                 _isMyTurn = false;
                 _lastTurnPlayer = T("dealer_resolution");
-                _dealerPersonaName = cleanedBannerName;
+                _dealerPersonaName = NormalizeDealerName(cleanedBannerName);
 
                 if (_pendingRoundQueue.Count > 0)
                 {
@@ -629,6 +724,20 @@ public sealed class Plugin : IDalamudPlugin
         var multiplier = 1L;
         if (raw.Length > 0 && (raw[^1] == 'k' || raw[^1] == 'K')) { multiplier = 1_000; raw = raw[..^1]; }
         else if (raw.Length > 0 && (raw[^1] == 'm' || raw[^1] == 'M')) { multiplier = 1_000_000; raw = raw[..^1]; }
+
+        // Si un suffixe k/m est present, "raw" peut contenir un point decimal (ex: "1.5m")
+        // qui n'est PAS un separateur de milliers mais une vraie decimale : il faut le
+        // traiter comme tel (1.5 * 1_000_000), pas jeter le point et lire "15".
+        if (multiplier > 1 && raw.Contains('.'))
+        {
+            var cleanedDecimal = new string(raw.Where(c => char.IsDigit(c) || c == '.').ToArray());
+            return double.TryParse(cleanedDecimal, System.Globalization.CultureInfo.InvariantCulture, out var dval)
+                ? (long)Math.Round(dval * multiplier)
+                : 0;
+        }
+
+        // Sinon (pas de suffixe, ou suffixe sans decimale) : "," et "." sont des separateurs
+        // de milliers, on les retire simplement.
         var digitsOnly = new string(raw.Where(char.IsDigit).ToArray());
         return long.TryParse(digitsOnly, out var val) ? val * multiplier : 0;
     }
@@ -907,7 +1016,15 @@ public sealed class Plugin : IDalamudPlugin
         if (_lastRecordedDealerValue.HasValue && _lastRecordedDealerValue.Value == dealerValue)
             return;
 
+        var nowUtc = DateTime.UtcNow;
+        if (_lastDealerRecordUtc != DateTime.MinValue && nowUtc - _lastDealerRecordUtc < MinDealerRecordInterval)
+        {
+            Log.Information($"[BlackjackAdvisor] (anti-triche) Enregistrement ignore (trop rapproche du precedent, {(nowUtc - _lastDealerRecordUtc).TotalSeconds:0.0}s) pour valeur {dealerValue}.");
+            return;
+        }
+
         _lastRecordedDealerValue = dealerValue;
+        _lastDealerRecordUtc = nowUtc;
         var category = dealerValue == 11 ? "A" : dealerValue >= 10 ? "10" : dealerValue.ToString();
         _currentRoundDealerUpCategory = category;
 

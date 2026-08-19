@@ -32,7 +32,9 @@ public class Configuration : IPluginConfiguration
 {
     // Version 1 = historique anti-triche global (bug, tous croupiers melanges).
     // Version 2 = historique anti-triche par croupier (DealerStatsByName).
-    public int Version { get; set; } = 2;
+    // Version 3 = cles DealerStatsByName normalisees (fusion des variantes d'un meme croupier
+    // dont le nom etait parfois decore de glyphes d'icone dans le chat).
+    public int Version { get; set; } = 3;
 
     // Anti-triche : historique par croupier, cle = nom de persona du croupier (ou "?" si le
     // nom n'a pas pu etre determine). Cumule entre sessions, par croupier.

@@ -4,7 +4,7 @@
     "Punchline": "Suggere le meilleur coup pendant les parties de blackjack en chat.",
     "Description": "Lit le chat, detecte les mains annoncees par le croupier, et affiche la decision optimale (strategie de base) dans un overlay. Ne clique et n'ecrit jamais rien automatiquement.",
     "InternalName": "BlackjackAdvisor",
-      "AssemblyVersion": "1.1.0.0",
+    "AssemblyVersion": "1.3.0.0",
     "RepoUrl": "https://github.com/luludufutur-cloud/BlackjackAdvisor",
     "ApplicableVersion": "any",
     "DalamudApiLevel": 15,
